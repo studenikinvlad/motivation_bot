@@ -1,4 +1,5 @@
 import logging
+import re
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler, filters,
@@ -17,6 +18,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Универсальная проверка регистрации
+async def ensure_registered(update: Update) -> bool:
+    user_id = update.effective_user.id
+    if user_id in ADMINS:
+        return True
+    if not db.get_user(user_id):
+        await update.message.reply_text("Вы не зарегистрированы. Напишите /start.")
+        return False
+    return True
 
 # Главное меню
 async def start(update: Update, context: CallbackContext):
@@ -38,6 +48,7 @@ async def start(update: Update, context: CallbackContext):
         return MAIN_MENU
 
 
+# Обновлённое главное меню
 async def show_main_menu(update: Update):
     user_id = update.effective_user.id
     if user_id in ADMINS:
@@ -47,7 +58,7 @@ async def show_main_menu(update: Update):
             [KeyboardButton("Проверка заявок на использование")],
             [KeyboardButton("История сотрудника")],
             [KeyboardButton("Сотрудники")],
-            [KeyboardButton("Удаление сотрудника")],
+            [KeyboardButton("Изменения")],
         ]
     else:
         buttons = [
@@ -63,6 +74,8 @@ async def show_main_menu(update: Update):
         await update.message.reply_text("Выберите действие:", reply_markup=markup)
     elif update.callback_query:
         await update.callback_query.message.reply_text("Выберите действие:", reply_markup=markup)
+
+
 #Базовые кнопки правила и прайс-лист
 
 async def send_price(update: Update, context: CallbackContext):
@@ -72,38 +85,72 @@ async def send_rules(update: Update, context: CallbackContext):
     await update.message.reply_text(rules_text)
 
 
-#регистрация сотрудника
+# Регистрация ФИО
 async def registration_fio(update: Update, context: CallbackContext):
     fio = update.message.text.strip()
     if not fio:
-        await update.message.reply_text("ФИО не может быть пустым. Пожалуйста, введите ваше ФИО:")
+        await update.message.reply_text("ФИО не может быть пустым. Введите снова:")
         return REGISTRATION_FIO
-
     context.user_data['fio'] = fio
-
-    buttons = [
-        [KeyboardButton("Консультант")],
-        [KeyboardButton("УСМ")]
-    ]
+    buttons = [[KeyboardButton("Консультант")], [KeyboardButton("УСМ")]]
     markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("Выберите вашу роль:", reply_markup=markup)
     return REGISTRATION_ROLE
 
+# Регистрация роли
 async def registration_role(update: Update, context: CallbackContext):
     role = update.message.text.strip()
     if role not in ["Консультант", "УСМ"]:
-        await update.message.reply_text("Пожалуйста, выберите роль из предложенных кнопок.")
+        await update.message.reply_text("Пожалуйста, выберите роль из кнопок.")
         return REGISTRATION_ROLE
-
-    fio = context.user_data.get('fio')
+    fio = context.user_data['fio']
     user_id = update.effective_user.id
-
-    # Сохраняем пользователя в БД
     db.add_user(user_id, fio, role)
-
     await update.message.reply_text(f"Регистрация завершена! Добро пожаловать, {fio} ({role}) 🎉")
     await show_main_menu(update)
     return MAIN_MENU
+
+# Меню изменений для админа
+async def show_admin_changes_menu(update: Update, context: CallbackContext):
+    buttons = [
+        [KeyboardButton("Удаление сотрудника")],
+        [KeyboardButton("Изменить правила")],
+        [KeyboardButton("Изменить прайс-лист")],
+        [KeyboardButton("Назад")],
+    ]
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("Меню изменений:", reply_markup=markup)
+
+# Ввод новых правил
+async def edit_rules(update: Update, context: CallbackContext):
+    context.user_data['edit_mode'] = 'rules'
+    await update.message.reply_text("Введите новый текст правил:")
+    return ENTER_DESCRIPTION
+
+# Ввод нового прайса
+async def edit_price(update: Update, context: CallbackContext):
+    context.user_data['edit_mode'] = 'price'
+    await update.message.reply_text("Введите новый прайс-лист:")
+    return ENTER_DESCRIPTION
+
+# Обработка изменения текста
+async def edit_text_input(update: Update, context: CallbackContext):
+    mode = context.user_data.get('edit_mode')
+    new_text = update.message.text.strip()
+    with open("config.py", "r", encoding="utf-8") as f:
+        content = f.read()
+    if mode == 'rules':
+        content = re.sub(r'rules_text\s*=\s*r?"""[\s\S]+?"""', f'rules_text = """\n{new_text}\n"""', content)
+        await update.message.reply_text("✅ Правила обновлены.")
+    elif mode == 'price':
+        content = re.sub(r'price_text\s*=\s*r?"""[\s\S]+?"""', f'price_text = """\n{new_text}\n"""', content)
+        await update.message.reply_text("✅ Прайс-лист обновлён.")
+    with open("config.py", "w", encoding="utf-8") as f:
+        f.write(content)
+    context.user_data['edit_mode'] = None
+    await show_main_menu(update)
+    return MAIN_MENU
+
 
 #Удаление сотрудника
 async def show_employees_for_admin(update, context):
@@ -418,9 +465,9 @@ async def show_approved_requests(update, context):
         await update.message.reply_text("Очередь пуста.")
         return
 
-    text_lines = []
+    text_lines = ["✅Одобренные заявки\n"]
     for req_id, fio, desc, date in requests:
-        text_lines.append(f"✅Одобренные заявки \n\n{fio} — {desc} ({date})")
+        text_lines.append(f" {fio} — {desc} ({date})")
     text = "\n".join(text_lines)
 
     keyboard = [
@@ -478,12 +525,15 @@ async def use_points(update: Update, context: CallbackContext):
     
     user_id = update.effective_user.id
     user_points = db.get_user(user_id)[3]
-    if user_points >= 0:
+    if user_points > 0:
         await update.message.reply_text("Опишите, как вы хотите использовать баллы:")
+        return ENTER_DESCRIPTION
     else:
         await update.message.reply_text(f"Заявка не может быть отправлена. \nВаш баланс: {user_points}")
+        return MAIN_MENU
+        
     
-    return ENTER_DESCRIPTION
+    
 
 async def use_points_description(update: Update, context: CallbackContext):
     desc = update.message.text.strip()
@@ -559,6 +609,9 @@ def main():
                 MessageHandler(filters.Regex("^Удаление сотрудника$"), show_employees_for_admin),         
                 MessageHandler(filters.Regex("^Прайс-лист$"), send_price), 
                 MessageHandler(filters.Regex("^Правила$"), send_rules),
+                MessageHandler(filters.Regex("^Изменения$"), show_admin_changes_menu),
+                MessageHandler(filters.Regex("^Изменить правила$"), edit_rules),
+                MessageHandler(filters.Regex("^Изменить прайс-лист$"), edit_price),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],
