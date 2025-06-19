@@ -5,12 +5,12 @@ from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboard
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler, filters,
                           ConversationHandler, CallbackContext)
 import db
-from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES, price_text, rules_text
+from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES
 
 # Стейты ConversationHandler
 (MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
  SELECT_REASON, CONFIRM_POINTS, SELECT_EMPLOYEE_FOR_HISTORY, SELECT_ACTION,
- ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE ) = range(12)
+ ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT ) = range(13)
 
 
 logging.basicConfig(
@@ -77,12 +77,27 @@ async def show_main_menu(update: Update):
 
 
 #Базовые кнопки правила и прайс-лист
+def load_price():
+    try:
+        with open("price.txt", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "⚠️ Прайс-лист не найден."
+
+
+def load_rules():
+    try:
+        with open("rules.txt", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "⚠️ Правила не найдены."
+
 
 async def send_price(update: Update, context: CallbackContext):
-    await update.message.reply_text(price_text)
+    await update.message.reply_text(load_price())
 
 async def send_rules(update: Update, context: CallbackContext):
-    await update.message.reply_text(rules_text)
+    await update.message.reply_text(load_rules())
 
 
 # Регистрация ФИО
@@ -121,32 +136,36 @@ async def show_admin_changes_menu(update: Update, context: CallbackContext):
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Меню изменений:", reply_markup=markup)
 
-# Ввод новых правил
 async def edit_rules(update: Update, context: CallbackContext):
     context.user_data['edit_mode'] = 'rules'
     await update.message.reply_text("Введите новый текст правил:")
-    return ENTER_DESCRIPTION
+    return EDIT_TEXT_INPUT
 
-# Ввод нового прайса
+
 async def edit_price(update: Update, context: CallbackContext):
     context.user_data['edit_mode'] = 'price'
     await update.message.reply_text("Введите новый прайс-лист:")
-    return ENTER_DESCRIPTION
+    return EDIT_TEXT_INPUT
 
-# Обработка изменения текста
+
 async def edit_text_input(update: Update, context: CallbackContext):
     mode = context.user_data.get('edit_mode')
     new_text = update.message.text.strip()
-    with open("config.py", "r", encoding="utf-8") as f:
-        content = f.read()
-    if mode == 'rules':
-        content = re.sub(r'rules_text\s*=\s*r?"""[\s\S]+?"""', f'rules_text = """\n{new_text}\n"""', content)
-        await update.message.reply_text("✅ Правила обновлены.")
-    elif mode == 'price':
-        content = re.sub(r'price_text\s*=\s*r?"""[\s\S]+?"""', f'price_text = """\n{new_text}\n"""', content)
-        await update.message.reply_text("✅ Прайс-лист обновлён.")
-    with open("config.py", "w", encoding="utf-8") as f:
-        f.write(content)
+
+    try:
+        if mode == 'rules':
+            with open("rules.txt", "w", encoding="utf-8") as f:
+                f.write(new_text)
+            await update.message.reply_text("✅ Правила обновлены.")
+        elif mode == 'price':
+            with open("price.txt", "w", encoding="utf-8") as f:
+                f.write(new_text)
+            await update.message.reply_text("✅ Прайс-лист обновлён.")
+        else:
+            await update.message.reply_text("⚠️ Неизвестный режим редактирования.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при сохранении: {e}")
+
     context.user_data['edit_mode'] = None
     await show_main_menu(update)
     return MAIN_MENU
@@ -623,6 +642,8 @@ def main():
             ENTER_DEDUCT_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deduct_points)],
             REGISTRATION_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_fio)],
             REGISTRATION_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_role)],
+            EDIT_TEXT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_text_input)],
+
         },
         fallbacks=[MessageHandler(filters.ALL, fallback)]
     )
