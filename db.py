@@ -1,202 +1,165 @@
-import sqlite3
-import threading
-from contextlib import contextmanager
-from datetime import datetime
+import asyncpg
+import logging
 
-DB_PATH = "botdb.sqlite"
-lock = threading.Lock()
+DB_HOST = 'amvera-studenikinvlad-cnpg-botapp-rw'
+DB_NAME = 'superdb'
+DB_USER = 'tgapps'
+DB_PASSWORD = 'qwerty'
+DB_PORT = 5432
 
-@contextmanager
-def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        """Подключение к базе данных и создание таблиц"""
+        try:
+            self.pool = await asyncpg.create_pool(
+                user='tgapps',
+                password='qwerty',
+                database='superdb',
+                host='amvera-studenikinvlad-cnpg-botapp-rw',
+                port=5432
+            )
+            await self._create_tables()
+            logging.info("✅ Подключение к PostgreSQL успешно.")
+        except Exception as e:
+            logging.error(f"Ошибка подключения к БД: {e}")
+            raise
+
+    async def _create_tables(self):
+        """Создание необходимых таблиц в базе данных"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY,
+                    full_name TEXT,
+                    role TEXT,
+                    points INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS usage_requests (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(id),
+                    description TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS history (
+                    id SERIAL PRIMARY KEY,
+                    admin_id BIGINT,
+                    user_id BIGINT,
+                    points INTEGER,
+                    reason TEXT,
+                    timestamp TIMESTAMP DEFAULT NOW()
+                );
+            """)
+
+    # --- Пользователи ---
+    async def get_user(self, user_id):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+
+    async def add_user(self, user_id, full_name, role):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (id, full_name, role, points)
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (id) DO NOTHING
+            """, user_id, full_name, role)
+
+    async def get_all_users(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM users")
+
+    async def delete_user(self, user_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+
+    # --- Баллы ---
+    async def add_points(self, admin_id, user_id, points, reason):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE users SET points = points + $1 WHERE id = $2
+            """, points, user_id)
+            await conn.execute("""
+                INSERT INTO history (admin_id, user_id, points, reason)
+                VALUES ($1, $2, $3, $4)
+            """, admin_id, user_id, points, reason)
+
+    async def get_history(self, user_id):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("""
+                SELECT * FROM history
+                WHERE user_id = $1
+                ORDER BY timestamp DESC
+            """, user_id)
+
+    async def get_employee_history(self, employee_id):
+        return await self.get_history(employee_id)
+
+    # --- Заявки ---
+    async def add_usage_request(self, user_id, description):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                INSERT INTO usage_requests (user_id, description)
+                VALUES ($1, $2) RETURNING id
+            """, user_id, description)
+            return row['id']
+
+    async def get_pending_requests(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("""
+                SELECT r.id, u.full_name, r.description, r.created_at
+                FROM usage_requests r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.status = 'pending'
+                ORDER BY r.created_at
+            """)
+
+    async def get_latest_approved_requests(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("""
+                SELECT r.id, u.full_name, r.description, r.created_at
+                FROM usage_requests r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.status = 'approved'
+                ORDER BY r.created_at DESC
+                LIMIT 10
+            """)
+
+    async def get_request(self, request_id):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("""
+                SELECT user_id, description, status, created_at
+                FROM usage_requests WHERE id = $1
+            """, request_id)
+
+    async def approve_request(self, request_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE usage_requests SET status = 'approved' WHERE id = $1
+            """, request_id)
+
+    async def reject_request(self, request_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE usage_requests SET status = 'rejected' WHERE id = $1
+            """, request_id)
+
+    async def clear_approved_requests(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM usage_requests WHERE status = 'approved'
+            """)
+
+
+# --- Глобальный экземпляр ---
+db = Database()
+
+# --- При запуске ---
+async def init_db():
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-def init_db():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            fio TEXT NOT NULL,
-            role TEXT NOT NULL,
-            points INTEGER DEFAULT 0
-        );
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS points_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            points INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        );
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS usage_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            description TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            timestamp TEXT NOT NULL
-        );
-        """)
-
-def add_user(user_id, fio, role):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        if cursor.fetchone():
-            return False
-        cursor.execute(
-            "INSERT INTO users (user_id, fio, role) VALUES (?, ?, ?)",
-            (user_id, fio, role)
-        )
-        return True
-
-def delete_user(user_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-
-def get_user(user_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, fio, role, points FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
-
-def get_all_users():
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, fio, role FROM users")
-        return cursor.fetchall()
-
-def add_points(admin_id, user_id, points, reason):
-    print(f"===> add_points called with: admin_id={admin_id}, user_id={user_id}, points={points}, reason={reason}")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET points = points + ? WHERE user_id = ?",
-            (points, user_id)
-        )
-        print("[DB] Points updated.")
-        cursor.execute(
-            "INSERT INTO points_history (admin_id, user_id, points, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (admin_id, user_id, points, reason, timestamp)
-        )
-        print("[DB] History inserted.")
-
-def get_points_history(user_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT admin_id, points, reason, timestamp FROM points_history WHERE user_id = ? ORDER BY timestamp DESC",
-            (user_id,)
-        )
-        return cursor.fetchall()
-
-def add_usage_request(user_id, description):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO usage_requests (user_id, description, status, timestamp) VALUES (?, ?, 'pending', ?)",
-            (user_id, description, timestamp)
-        )
-        return cursor.lastrowid
-
-
-def get_user_points_by_request_id(req_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT u.points
-            FROM usage_requests ur
-            JOIN users u ON ur.user_id = u.user_id
-            WHERE ur.id = ?
-        """, (req_id,))
-        row = cursor.fetchone()
-        return row[0] if row else None
-
-
-def get_request(req_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, description, status, timestamp FROM usage_requests WHERE id=?", (req_id,))
-        row = cursor.fetchone()
-    return row
-
-
-
-def get_pending_requests():
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, user_id, description, timestamp FROM usage_requests WHERE status = 'pending' ORDER BY timestamp ASC"
-        )
-        requests = cursor.fetchall()
-        results = []
-        for req_id, user_id, desc, ts in requests:
-            cursor.execute("SELECT fio FROM users WHERE user_id = ?", (user_id,))
-            fio = cursor.fetchone()
-            fio = fio[0] if fio else "Неизвестный"
-            results.append((req_id, fio, desc, ts))
-        return results
-
-def approve_request(req_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE usage_requests SET status = 'approved' WHERE id = ?",
-            (req_id,)
-        )
-
-def reject_request(req_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE usage_requests SET status = 'rejected' WHERE id = ?",
-            (req_id,)
-        )
-
-def get_latest_approved_requests():
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT ur.id, u.fio, ur.description, DATE(ur.timestamp) as date_only
-            FROM usage_requests ur
-            JOIN users u ON ur.user_id = u.user_id
-            WHERE ur.status = 'approved'
-            ORDER BY ur.timestamp DESC
-            """
-        )
-        return cursor.fetchall()
-    
-def get_request_status(req_id):
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT status FROM usage_requests WHERE id = ?",
-            (req_id,)
-        )
-        result = cursor.fetchone()
-        if result:
-            return result[0]
-        else:
-            return None
-
-def clear_approved_requests():
-    with lock, get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM usage_requests WHERE status = 'approved'")
-
-init_db()
+        await db.connect()
+        print("✅ Подключение к PostgreSQL успешно.")
+    except Exception as e:
+        logging.error(f"Ошибка подключения к БД: {e}")
