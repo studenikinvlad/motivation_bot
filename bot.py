@@ -1,7 +1,7 @@
 import logging
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -19,8 +19,9 @@ from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES,
 (
     MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
     SELECT_REASON, CONFIRM_POINTS, SELECT_EMPLOYEE_FOR_HISTORY, SELECT_ACTION,
-    ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT
-) = range(13)
+    ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT,
+    SELECT_USAGE_TYPE, SELECT_DATE  # Добавленные состояния
+) = range(15)
 
 # Настройка логирования
 logging.basicConfig(
@@ -554,12 +555,100 @@ async def use_points(update: Update, context: CallbackContext):
         await update.message.reply_text("Вы не зарегистрированы.")
         return MAIN_MENU
 
-    if user[3] > 0:
+    if user[3] <= 0:
+        await update.message.reply_text(f"Заявка не может быть отправлена. \nВаш баланс: {user[3]}")
+        return MAIN_MENU
+
+    # Перенаправляем в новое состояние выбора типа использования
+    buttons = [
+        [KeyboardButton("Уйти на 1 час раньше")],
+        [KeyboardButton("Уйти на 2 часа раньше")],
+        [KeyboardButton("Уйти на 3 часа раньше")],
+        [KeyboardButton("Другое использование")],
+    ]
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("Выберите как вы хотите использовать баллы:", reply_markup=markup)
+    return SELECT_USAGE_TYPE  # Изменено с ENTER_DESCRIPTION
+
+async def select_usage_type(update: Update, context: CallbackContext):
+    """Обработка выбора типа использования баллов."""
+    choice = update.message.text
+    context.user_data['usage_type'] = choice
+    
+    if choice.startswith("Уйти на"):
+        # Сохраняем количество часов
+        hours = int(choice.split()[2])
+        context.user_data['hours'] = hours
+        
+        # Создаем простой календарь (можно улучшить с помощью datepicker)
+        today = datetime.now().date()
+        buttons = []
+        for i in range(1, 8):  # На 7 дней вперед
+            date = today + timedelta(days=i)
+            buttons.append([KeyboardButton(date.strftime("%d.%m.%Y"))])
+        
+        buttons.append([KeyboardButton("Отмена")])
+        markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Выберите дату, когда хотите уйти раньше:", reply_markup=markup)
+        return SELECT_DATE
+    elif choice == "Другое использование":
         await update.message.reply_text("Опишите, как вы хотите использовать баллы:")
         return ENTER_DESCRIPTION
     else:
-        await update.message.reply_text(f"Заявка не может быть отправлена. \nВаш баланс: {user[3]}")
+        await update.message.reply_text("Неверный выбор.")
         return MAIN_MENU
+    
+async def select_date(update: Update, context: CallbackContext):
+    """Обработка выбора даты для ухода раньше."""
+    date_str = update.message.text
+    if date_str == "Отмена":
+        await show_main_menu(update)
+        return MAIN_MENU
+
+    try:
+        selected_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+    except ValueError:
+        await update.message.reply_text("Неверный формат даты. Попробуйте снова.")
+        return SELECT_DATE
+
+    hours = context.user_data['hours']
+    cost = 150 * hours  # 150 баллов за час
+    
+    # Формируем описание для заявки
+    description = f"Уйти на {hours} часа раньше {date_str} (стоимость: {cost} баллов)"
+    
+    # Проверяем баланс
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    if user[3] < cost:
+        await update.message.reply_text(f"Недостаточно баллов. Ваш баланс: {user[3]}, требуется: {cost}")
+        return MAIN_MENU
+    
+    # Отправляем заявку
+    req_id = await db.add_usage_request(user_id, description)
+    await update.message.reply_text(f"Заявка отправлена: {description}")
+    
+    # Уведомляем админов
+    for admin_id in ADMINS:
+        try:
+            buttons = [
+                [
+                    InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{req_id}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{req_id}")
+                ]
+            ]
+            markup = InlineKeyboardMarkup(buttons)
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"Новая заявка на использование баллов от {user[1]} (баланс: {user[3]} баллов):\n\n{description}",
+                reply_markup=markup
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение админу: {e}")
+
+    await show_main_menu(update)
+    return MAIN_MENU
+
 
 async def use_points_description(update: Update, context: CallbackContext):
     """Отправка заявки на использование баллов."""
@@ -591,6 +680,7 @@ async def use_points_description(update: Update, context: CallbackContext):
 
     await show_main_menu(update)
     return MAIN_MENU
+
 
 async def fallback(update: Update, context: CallbackContext):
     """Обработчик неизвестных команд."""
@@ -634,6 +724,8 @@ async def main():
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],
             SELECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_reason)],
             ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, use_points_description)],
+            SELECT_USAGE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_usage_type)],
+            SELECT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_date)],
             SELECT_EMPLOYEE_FOR_HISTORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_employee_history)],
             SELECT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
             ENTER_CUSTOM_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_custom_points)],
