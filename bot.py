@@ -1,7 +1,8 @@
 import logging
 import asyncio
-import re
+from telegram.error import BadRequest
 from datetime import datetime, timedelta
+from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,14 +15,17 @@ from telegram.ext import (
 )
 from db import db
 from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES, price_text, rules_text, SUPERADMINS
-
+from calendar import monthrange, month_name
+import locale
 # Состояния ConversationHandler
 (
     MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
     SELECT_REASON, CONFIRM_POINTS, SELECT_EMPLOYEE_FOR_HISTORY, SELECT_ACTION,
     ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT,
-    SELECT_USAGE_TYPE, SELECT_DATE  # Добавленные состояния
-) = range(15)
+    SELECT_USAGE_TYPE, SELECT_DATE, CONFIRM_REQUEST   # Добавленные состояния
+) = range(16)
+
+locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
 
 # Настройка логирования
 logging.basicConfig(
@@ -547,6 +551,10 @@ async def handle_admin_action(update: Update, context: CallbackContext):
         await context.bot.send_message(chat_id=user_id, text="❌ Ваша заявка была отклонена.")
         await query.edit_message_text("❌ Заявка отклонена.")
 
+#-------------------------------------------------------------------------------------------------------------#
+
+
+
 async def use_points(update: Update, context: CallbackContext):
     """Использование баллов."""
     user_id = update.effective_user.id
@@ -568,7 +576,84 @@ async def use_points(update: Update, context: CallbackContext):
     ]
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выберите как вы хотите использовать баллы:", reply_markup=markup)
-    return SELECT_USAGE_TYPE  # Изменено с ENTER_DESCRIPTION
+    return SELECT_USAGE_TYPE  
+
+#--------------------------ебучий календарь------------------------------------------------#
+
+def generate_calendar_keyboard(year: int, month: int, min_date: datetime = None) -> InlineKeyboardMarkup:
+    """
+    Генерирует инлайн-клавиатуру календаря для указанного месяца и года.
+    min_date - минимальная доступная дата (сегодня или позже)
+    """
+    # Если min_date не указана, используем сегодня
+    if min_date is None:
+        min_date = datetime.now().date()
+    
+    # Определяем первый день месяца и количество дней в месяце
+    _, num_days = monthrange(year, month)
+    first_weekday, _ = monthrange(year, month)  # День недели первого дня (0-понедельник, 6-воскресенье)
+    
+    # Создаем заголовок с названием месяца и года
+    month_title = f"{month_name[month].capitalize()} {year}"
+    
+    # Создаем строки для клавиатуры
+    keyboard = []
+    
+    # Кнопки навигации
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+    
+    nav_buttons = [
+        InlineKeyboardButton("◀️", callback_data=f"nav_{prev_year}-{prev_month}"),
+        InlineKeyboardButton(month_title, callback_data="ignore"),
+        InlineKeyboardButton("▶️", callback_data=f"nav_{next_year}-{next_month}")
+    ]
+    keyboard.append(nav_buttons)
+    
+    # Заголовки дней недели
+    days_of_week = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    keyboard.append([InlineKeyboardButton(day, callback_data="ignore") for day in days_of_week])
+    
+    # Генерируем дни месяца
+    day_buttons = []
+    current_row = []
+    
+    # Пустые кнопки для дней предыдущего месяца
+    for _ in range(first_weekday):
+        current_row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+    
+    # Добавляем кнопки для каждого дня месяца
+    for day in range(1, num_days + 1):
+        date_obj = datetime(year, month, day).date()
+        
+        # Проверяем, можно ли выбрать эту дату
+        if date_obj < min_date:
+            # Прошедшие даты - неактивны
+            current_row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+        else:
+            # Активные даты
+            current_row.append(InlineKeyboardButton(str(day), callback_data=f"date_{year}-{month}-{day}"))
+        
+        # Переход на новую строку после субботы (6-й день)
+        if len(current_row) == 7:
+            day_buttons.append(current_row)
+            current_row = []
+    
+    # Добавляем оставшиеся дни
+    if current_row:
+        # Заполняем пустые места
+        while len(current_row) < 7:
+            current_row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+        day_buttons.append(current_row)
+    
+    keyboard.extend(day_buttons)
+    
+    # Кнопка отмены
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_calendar")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 async def select_usage_type(update: Update, context: CallbackContext):
     """Обработка выбора типа использования баллов."""
@@ -576,78 +661,264 @@ async def select_usage_type(update: Update, context: CallbackContext):
     context.user_data['usage_type'] = choice
     
     if choice.startswith("Уйти на"):
-        # Сохраняем количество часов
         hours = int(choice.split()[2])
         context.user_data['hours'] = hours
         
-        # Создаем простой календарь (можно улучшить с помощью datepicker)
+        # Получаем текущую дату
         today = datetime.now().date()
-        buttons = []
-        for i in range(1, 8):  # На 7 дней вперед
-            date = today + timedelta(days=i)
-            buttons.append([KeyboardButton(date.strftime("%d.%m.%Y"))])
         
-        buttons.append([KeyboardButton("Отмена")])
-        markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text("Выберите дату, когда хотите уйти раньше:", reply_markup=markup)
+        # Генерируем календарь на текущий месяц
+        keyboard = generate_calendar_keyboard(today.year, today.month, min_date=today)
+        
+        await update.message.reply_text(
+            "Выберите дату для ухода:",
+            reply_markup=keyboard
+        )
         return SELECT_DATE
-    elif choice == "Другое использование":
+    
+    else:  # Другое использование
         await update.message.reply_text("Опишите, как вы хотите использовать баллы:")
         return ENTER_DESCRIPTION
-    else:
-        await update.message.reply_text("Неверный выбор.")
+
+async def handle_calendar(update: Update, context: CallbackContext):
+    """Обработка выбора даты в календаре."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Обработка навигации (переключение месяцев)
+    if query.data.startswith("nav_"):
+        # Извлекаем год и месяц из callback_data
+        year, month = map(int, query.data.split("_")[1].split("-"))
+        
+        # Получаем минимальную доступную дату (сегодня)
+        min_date = datetime.now().date()
+        
+        # Генерируем новый календарь
+        keyboard = generate_calendar_keyboard(year, month, min_date=min_date)
+        
+        # Обновляем сообщение
+        try:
+            await query.edit_message_text(
+                "Выберите дату для ухода:",
+                reply_markup=keyboard
+            )
+        except BadRequest:
+            pass  # Игнорируем ошибку, если сообщение не изменилось
+        return SELECT_DATE
+    
+    # Обработка выбора даты
+    elif query.data.startswith("date_"):
+        # Извлекаем дату из callback_data
+        year, month, day = map(int, query.data.split("_")[1].split("-"))
+        selected_date = datetime(year, month, day).date()
+        
+        # Проверяем доступность даты
+        date_str = selected_date.strftime("%Y-%m-%d")
+        if not await db.is_date_available(date_str):
+            await query.answer("Эта дата уже занята. Выберите другую.", show_alert=True)
+            return SELECT_DATE
+        
+        # Сохраняем выбранную дату
+        context.user_data['date'] = selected_date
+        hours = context.user_data['hours']
+        cost = 150 * hours
+        date_display = selected_date.strftime("%d.%m.%Y")
+        description = f"Уйти на {hours} часа раньше {date_display} (стоимость: {cost} баллов)"
+        context.user_data['description'] = description
+        
+        # Запрашиваем подтверждение с inline-кнопками
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_request"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_request")
+            ]
+        ])
+        
+        await query.edit_message_text(
+            f"Вы выбрали дату: {date_display}\n"
+            f"Описание: {description}\n\n"
+            f"Отправить заявку?",
+            reply_markup=keyboard
+        )
+        return CONFIRM_REQUEST
+    
+    # Обработка отмены
+    elif query.data == "cancel_calendar":
+        try:
+            await query.message.delete()
+        except BadRequest:
+            pass
+        
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Выбор даты отменен."
+        )
+        await show_main_menu_for_chat(context, query.message.chat_id, query.from_user.id)
         return MAIN_MENU
     
-async def select_date(update: Update, context: CallbackContext):
-    """Обработка выбора даты для ухода раньше."""
+    # Игнорируем другие нажатия
+    return SELECT_DATE
+
+async def cancel_date_selection(update: Update, context: CallbackContext):
+    """Обработка отмены выбора даты."""
+    await update.message.reply_text("Выбор даты отменен.")
+    await show_main_menu(update)
+    return MAIN_MENU
+
+async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_id: int):
+    """Отправка главного меню по chat_id."""
+    if user_id in ADMINS:
+        buttons = [
+            [KeyboardButton("Начислить/Списать баллы")],
+            [KeyboardButton("Очередь использования баллов")],
+            [KeyboardButton("Проверка заявок на использование")],
+            [KeyboardButton("История сотрудника")],
+            [KeyboardButton("Сотрудники")],
+            [KeyboardButton("Изменения")],
+        ]
+    elif user_id in SUPERADMINS:
+        buttons = [
+            [KeyboardButton("Начислить/Списать баллы")],
+            [KeyboardButton("Начислить/Списать баллы (silent)")],
+            [KeyboardButton("Очередь использования баллов")],
+            [KeyboardButton("Проверка заявок на использование")],
+            [KeyboardButton("История сотрудника")],
+            [KeyboardButton("Сотрудники")],
+            [KeyboardButton("Изменения")],
+        ]
+    else:
+        buttons = [
+            [KeyboardButton("Мой баланс")],
+            [KeyboardButton("История")],
+            [KeyboardButton("Использовать баллы")],
+            [KeyboardButton("Сотрудники")],
+            [KeyboardButton("Прайс-лист")],
+            [KeyboardButton("Правила")],
+        ]
+    
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    await context.bot.send_message(chat_id=chat_id, text="Выберите действие:", reply_markup=markup)
+    
+async def handle_date_selection(update: Update, context: CallbackContext):
+    """Обработка выбора дня"""
     date_str = update.message.text
+    
     if date_str == "Отмена":
         await show_main_menu(update)
         return MAIN_MENU
-
+    
     try:
-        selected_date = datetime.strptime(date_str, "%d.%m.%Y").date()
-    except ValueError:
+        # Парсим дату
+        day, month, year = map(int, date_str.split('.'))
+        selected_date = datetime(year, month, day).date()
+        
+        # Проверяем, что дата не в прошлом
+        today = datetime.now().date()
+        if selected_date < today:
+            await update.message.reply_text("Нельзя выбрать прошедшую дату. Выберите другую дату.")
+            return SELECT_DATE
+        
+        # Проверяем доступность даты
+        date_db_format = selected_date.strftime("%Y-%m-%d")
+        if not await db.is_date_available(date_db_format):
+            await update.message.reply_text("Эта дата больше не доступна. Выберите другую.")
+            return SELECT_DATE
+        
+        hours = context.user_data['hours']
+        cost = 150 * hours
+        date_display = selected_date.strftime("%d.%m.%Y")
+        description = f"Уйти на {hours} часа раньше {date_display} (стоимость: {cost} баллов)"
+        
+        # Сохраняем данные для подтверждения
+        context.user_data['description'] = description
+        context.user_data['date'] = selected_date
+        
+        # Запрашиваем подтверждение
+        await update.message.reply_text(
+            f"Вы выбрали дату: {date_display}\n"
+            f"Описание: {description}\n\n"
+            f"Отправить заявку?",
+            reply_markup=ReplyKeyboardMarkup([
+                [KeyboardButton("✅ Подтвердить"), KeyboardButton("❌ Отмена")]
+            ], resize_keyboard=True)
+        )
+        return CONFIRM_REQUEST
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки даты: {e}")
         await update.message.reply_text("Неверный формат даты. Попробуйте снова.")
         return SELECT_DATE
 
-    hours = context.user_data['hours']
-    cost = 150 * hours  # 150 баллов за час
+
+async def handle_confirmation(update: Update, context: CallbackContext):
+    """Обработка подтверждения заявки"""
+    query = update.callback_query
+    await query.answer()
     
-    # Формируем описание для заявки
-    description = f"Уйти на {hours} часа раньше {date_str} (стоимость: {cost} баллов)"
-    
-    # Проверяем баланс
-    user_id = update.effective_user.id
-    user = await db.get_user(user_id)
-    if user[3] < cost:
-        await update.message.reply_text(f"Недостаточно баллов. Ваш баланс: {user[3]}, требуется: {cost}")
+    if query.data == "confirm_request":
+        description = context.user_data.get('description', '')
+        user_id = query.from_user.id
+        hours = context.user_data.get('hours', 1)
+        cost = 150 * hours
+        
+        # Проверяем баланс
+        user = await db.get_user(user_id)
+        if not user:
+            await query.edit_message_text("❌ Ошибка: пользователь не найден.")
+            return ConversationHandler.END
+            
+        if user[3] < cost:
+            await query.edit_message_text(f"❌ Недостаточно баллов. Ваш баланс: {user[3]}, требуется: {cost}")
+            return ConversationHandler.END
+        
+        # Отправляем заявку
+        req_id = await db.add_usage_request(user_id, description)
+        
+        # Обновляем сообщение с подтверждением
+        await query.edit_message_text(
+            f"✅ Заявка отправлена!\n\n"
+            f"Описание: {description}\n"
+            f"Администраторы получили уведомление."
+        )
+        
+        # Уведомляем админов
+        for admin_id in ADMINS:
+            try:
+                buttons = [
+                    [
+                        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{req_id}"),
+                        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{req_id}")
+                    ]
+                ]
+                markup = InlineKeyboardMarkup(buttons)
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"📩 Новая заявка на использование баллов\n\n"
+                         f"👤 Сотрудник: {user[1]}\n"
+                         f"📌 Описание: {description}\n"
+                         f"💰 Баланс: {user[3]} баллов",
+                    reply_markup=markup
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+        
+        await show_main_menu_for_chat(context, query.message.chat_id, user_id)
         return MAIN_MENU
     
-    # Отправляем заявку
-    req_id = await db.add_usage_request(user_id, description)
-    await update.message.reply_text(f"Заявка отправлена: {description}")
+    elif query.data == "cancel_request":
+        # Обновляем сообщение с подтверждением
+        await query.edit_message_text("❌ Заявка отменена.")
+        
+        await show_main_menu_for_chat(context, query.message.chat_id, query.from_user.id)
+        return MAIN_MENU
     
-    # Уведомляем админов
-    for admin_id in ADMINS:
-        try:
-            buttons = [
-                [
-                    InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{req_id}"),
-                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{req_id}")
-                ]
-            ]
-            markup = InlineKeyboardMarkup(buttons)
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"Новая заявка на использование баллов от {user[1]} (баланс: {user[3]} баллов):\n\n{description}",
-                reply_markup=markup
-            )
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение админу: {e}")
+    return CONFIRM_REQUEST
 
-    await show_main_menu(update)
-    return MAIN_MENU
+async def ignore_callback(update: Update, context: CallbackContext):
+    """Игнорирует нажатия на недоступные даты"""
+    query = update.callback_query
+    await query.answer()
+
 
 
 async def use_points_description(update: Update, context: CallbackContext):
@@ -699,7 +970,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_queue_buttons, pattern="^(clear_queue|back_to_menu)$"))
     app.add_handler(CallbackQueryHandler(show_employees_by_role, pattern="^role_"))
     app.add_handler(CallbackQueryHandler(handle_delete_user, pattern=r"^delete_user_\d+$"))
-
+    # Добавьте этот обработчик в main()
+    app.add_handler(CallbackQueryHandler(ignore_callback, pattern="^ignore$"))
+    app.add_handler(CallbackQueryHandler(handle_calendar, pattern=r"^(nav|date|cancel)_"))
+    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern="^(confirm_request|cancel_request)$"))
     # Основной обработчик диалогов
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -725,7 +999,8 @@ async def main():
             SELECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_reason)],
             ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, use_points_description)],
             SELECT_USAGE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_usage_type)],
-            SELECT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_date)],
+            SELECT_DATE: [CallbackQueryHandler(handle_calendar, pattern=r"^calendar"),
+                MessageHandler(filters.Regex("^Отмена$"), cancel_date_selection)],
             SELECT_EMPLOYEE_FOR_HISTORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_employee_history)],
             SELECT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
             ENTER_CUSTOM_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_custom_points)],
