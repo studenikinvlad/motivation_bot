@@ -34,6 +34,7 @@ class Database:
                 description TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                usage_date TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
 
@@ -46,6 +47,11 @@ class Database:
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        try:
+            await db.execute("ALTER TABLE usage_requests ADD COLUMN usage_date TEXT")
+            await db.commit()
+        except aiosqlite.OperationalError:
+            pass
         await db.commit()
 
     # --- Пользователи ---
@@ -104,12 +110,12 @@ class Database:
         return await self.get_history(employee_id)
 
     # --- Заявки ---
-    async def add_usage_request(self, user_id, description):
+    async def add_usage_request(self, user_id, description, usage_date=None):
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO usage_requests (user_id, description)
-                VALUES (?, ?)
-            """, (user_id, description))
+                INSERT INTO usage_requests (user_id, description, usage_date)
+                VALUES (?, ?, ?)
+            """, (user_id, description, usage_date))
             await db.commit()
             return cursor.lastrowid
 
@@ -146,6 +152,61 @@ class Database:
                 FROM usage_requests WHERE id = ?
             """, (request_id,))
             return await cursor.fetchone()
+
+    # В класс Database добавим новый метод
+    async def is_date_available(self, date: str, user_id: int = None) -> bool:
+        """Проверяет, доступна ли дата для заявки (не более 3 заявок одного типа)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Получаем информацию о пользователе, если user_id передан
+            user_role = None
+            if user_id:
+                user = await self.get_user(user_id)
+                if user:
+                    user_role = user['role']
+            
+            # Если это заявка на уход раньше и мы знаем роль пользователя
+            if user_role in ["Консультант", "УСМ"]:
+                cursor = await db.execute("""
+                    SELECT COUNT(*) 
+                    FROM usage_requests r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE DATE(r.usage_date) = ? 
+                    AND r.status = 'approved'
+                    AND u.role = ?
+                    AND r.description LIKE 'Уйти на%'
+                """, (date, user_role))
+            else:
+                # Для других типов заявок проверяем все
+                cursor = await db.execute("""
+                    SELECT COUNT(*) 
+                    FROM usage_requests 
+                    WHERE DATE(usage_date) = ? 
+                    AND status = 'approved'
+                """, (date,))
+                
+            count = await cursor.fetchone()
+            return count[0] < 3 if count else True
+        
+    async def get_approved_requests_for_date(self, date: str, role: str = None):
+        """Получает одобренные заявки на конкретную дату использования"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = """
+                SELECT r.id, u.full_name, r.description, r.usage_date, u.role
+                FROM usage_requests r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.status = 'approved' AND r.usage_date = ?
+            """
+            params = [date]
+            
+            if role:
+                query += " AND u.role = ?"
+                params.append(role)
+                
+            query += " ORDER BY r.usage_date"
+            
+            cursor = await db.execute(query, params)
+            return await cursor.fetchall()   
 
     async def approve_request(self, request_id):
         async with aiosqlite.connect(self.db_path) as db:

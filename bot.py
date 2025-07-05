@@ -1,8 +1,8 @@
 import logging
 import asyncio
+from telegram.ext import Application  
 from telegram.error import BadRequest
-from datetime import datetime, timedelta
-from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
+from datetime import datetime, timedelta, time
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,10 +22,10 @@ import locale
     MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
     SELECT_REASON, CONFIRM_POINTS, SELECT_EMPLOYEE_FOR_HISTORY, SELECT_ACTION,
     ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT,
-    SELECT_USAGE_TYPE, SELECT_DATE, CONFIRM_REQUEST   # Добавленные состояния
-) = range(16)
+    SELECT_USAGE_TYPE, SELECT_DATE, CONFIRM_REQUEST, CANCEL_REQUEST    # Добавленные состояния
+) = range(17)
 
-locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
+locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
 
 # Настройка логирования
 logging.basicConfig(
@@ -69,6 +69,7 @@ async def show_main_menu(update: Update):
         buttons = [
             [KeyboardButton("Начислить/Списать баллы")],
             [KeyboardButton("Очередь использования баллов")],
+            [KeyboardButton("Заявки на сегодня")],  # Новая кнопка
             [KeyboardButton("Проверка заявок на использование")],
             [KeyboardButton("История сотрудника")],
             [KeyboardButton("Сотрудники")],
@@ -79,6 +80,7 @@ async def show_main_menu(update: Update):
             [KeyboardButton("Начислить/Списать баллы")],
             [KeyboardButton("Начислить/Списать баллы (silent)")],
             [KeyboardButton("Очередь использования баллов")],
+            [KeyboardButton("Заявки на сегодня")],  # Новая кнопка
             [KeyboardButton("Проверка заявок на использование")],
             [KeyboardButton("История сотрудника")],
             [KeyboardButton("Сотрудники")],
@@ -89,6 +91,7 @@ async def show_main_menu(update: Update):
             [KeyboardButton("Мой баланс")],
             [KeyboardButton("История")],
             [KeyboardButton("Использовать баллы")],
+            [KeyboardButton("Заявки на сегодня")],  # Новая кнопка
             [KeyboardButton("Сотрудники")],
             [KeyboardButton("Прайс-лист")],
             [KeyboardButton("Правила")],
@@ -573,11 +576,17 @@ async def use_points(update: Update, context: CallbackContext):
         [KeyboardButton("Уйти на 2 часа раньше")],
         [KeyboardButton("Уйти на 3 часа раньше")],
         [KeyboardButton("Другое использование")],
+        [KeyboardButton("Назад")]  # Добавляем кнопку "Назад"
     ]
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выберите как вы хотите использовать баллы:", reply_markup=markup)
     return SELECT_USAGE_TYPE  
 
+
+async def back_to_main_menu(update: Update, context: CallbackContext):
+    """Возврат в главное меню из любого места."""
+    await show_main_menu(update)
+    return MAIN_MENU
 #--------------------------ебучий календарь------------------------------------------------#
 
 def generate_calendar_keyboard(year: int, month: int, min_date: datetime = None) -> InlineKeyboardMarkup:
@@ -676,6 +685,9 @@ async def select_usage_type(update: Update, context: CallbackContext):
         )
         return SELECT_DATE
     
+    elif choice == "Назад":
+        return await back_to_main_menu(update, context)
+    
     else:  # Другое использование
         await update.message.reply_text("Опишите, как вы хотите использовать баллы:")
         return ENTER_DESCRIPTION
@@ -687,38 +699,66 @@ async def handle_calendar(update: Update, context: CallbackContext):
     
     # Обработка навигации (переключение месяцев)
     if query.data.startswith("nav_"):
-        # Извлекаем год и месяц из callback_data
         year, month = map(int, query.data.split("_")[1].split("-"))
-        
-        # Получаем минимальную доступную дату (сегодня)
         min_date = datetime.now().date()
-        
-        # Генерируем новый календарь
         keyboard = generate_calendar_keyboard(year, month, min_date=min_date)
-        
-        # Обновляем сообщение
         try:
             await query.edit_message_text(
                 "Выберите дату для ухода:",
                 reply_markup=keyboard
             )
         except BadRequest:
-            pass  # Игнорируем ошибку, если сообщение не изменилось
+            pass
         return SELECT_DATE
     
     # Обработка выбора даты
     elif query.data.startswith("date_"):
-        # Извлекаем дату из callback_data
         year, month, day = map(int, query.data.split("_")[1].split("-"))
         selected_date = datetime(year, month, day).date()
-        
-        # Проверяем доступность даты
         date_str = selected_date.strftime("%Y-%m-%d")
-        if not await db.is_date_available(date_str):
-            await query.answer("Эта дата уже занята. Выберите другую.", show_alert=True)
+        
+        # Получаем информацию о пользователе для проверки по роли
+        user = await db.get_user(query.from_user.id)
+        if not user:
+            await query.answer("Ошибка: пользователь не найден", show_alert=True)
             return SELECT_DATE
         
-        # Сохраняем выбранную дату
+        # Проверяем доступность даты с учетом роли
+        is_available = await db.is_date_available(date_str, query.from_user.id)
+        
+        if not is_available:
+            # Получаем количество занятых слотов
+            requests = await db.get_approved_requests_for_date(date_str, user['role'])
+            count = len(requests)
+            
+            # Краткое сообщение в alert
+            await query.answer(
+                f"❌ На {selected_date.strftime('%d.%m.%Y')} уже {count} заявок вашей роли. "
+                "Выберите другую дату.",
+                show_alert=True
+            )
+            
+            # Дополнительное сообщение с деталями (если нужно)
+            message = (
+                f"На {selected_date.strftime('%d.%m.%Y')} уже запланированы:\n"
+                + "\n".join(f"• {req['full_name']} — {req['description']}" for req in requests[:3])  # Ограничиваем количество
+            )
+            
+            # Если заявок больше 3, добавляем пояснение
+            if count > 3:
+                message += f"\n\n...и ещё {count-3} заявок"
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=message
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить детализацию: {e}")
+            
+            return SELECT_DATE
+        
+        # Если дата доступна - продолжаем
         context.user_data['date'] = selected_date
         hours = context.user_data['hours']
         cost = 150 * hours
@@ -726,7 +766,6 @@ async def handle_calendar(update: Update, context: CallbackContext):
         description = f"Уйти на {hours} часа раньше {date_display} (стоимость: {cost} баллов)"
         context.user_data['description'] = description
         
-        # Запрашиваем подтверждение с inline-кнопками
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_request"),
@@ -756,8 +795,8 @@ async def handle_calendar(update: Update, context: CallbackContext):
         await show_main_menu_for_chat(context, query.message.chat_id, query.from_user.id)
         return MAIN_MENU
     
-    # Игнорируем другие нажатия
     return SELECT_DATE
+
 
 async def cancel_date_selection(update: Update, context: CallbackContext):
     """Обработка отмены выбора даты."""
@@ -767,37 +806,52 @@ async def cancel_date_selection(update: Update, context: CallbackContext):
 
 async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_id: int):
     """Отправка главного меню по chat_id."""
-    if user_id in ADMINS:
-        buttons = [
-            [KeyboardButton("Начислить/Списать баллы")],
-            [KeyboardButton("Очередь использования баллов")],
-            [KeyboardButton("Проверка заявок на использование")],
-            [KeyboardButton("История сотрудника")],
-            [KeyboardButton("Сотрудники")],
-            [KeyboardButton("Изменения")],
-        ]
-    elif user_id in SUPERADMINS:
-        buttons = [
-            [KeyboardButton("Начислить/Списать баллы")],
-            [KeyboardButton("Начислить/Списать баллы (silent)")],
-            [KeyboardButton("Очередь использования баллов")],
-            [KeyboardButton("Проверка заявок на использование")],
-            [KeyboardButton("История сотрудника")],
-            [KeyboardButton("Сотрудники")],
-            [KeyboardButton("Изменения")],
-        ]
-    else:
-        buttons = [
-            [KeyboardButton("Мой баланс")],
-            [KeyboardButton("История")],
-            [KeyboardButton("Использовать баллы")],
-            [KeyboardButton("Сотрудники")],
-            [KeyboardButton("Прайс-лист")],
-            [KeyboardButton("Правила")],
-        ]
-    
-    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-    await context.bot.send_message(chat_id=chat_id, text="Выберите действие:", reply_markup=markup)
+    try:
+        if user_id in ADMINS:
+            buttons = [
+                [KeyboardButton("Начислить/Списать баллы")],
+                [KeyboardButton("Очередь использования баллов")],
+                [KeyboardButton("Проверка заявок на использование")],
+                [KeyboardButton("История сотрудника")],
+                [KeyboardButton("Сотрудники")],
+                [KeyboardButton("Изменения")],
+            ]
+        elif user_id in SUPERADMINS:
+            buttons = [
+                [KeyboardButton("Начислить/Списать баллы")],
+                [KeyboardButton("Начислить/Списать баллы (silent)")],
+                [KeyboardButton("Очередь использования баллов")],
+                [KeyboardButton("Проверка заявок на использование")],
+                [KeyboardButton("История сотрудника")],
+                [KeyboardButton("Сотрудники")],
+                [KeyboardButton("Изменения")],
+            ]
+        else:
+            buttons = [
+                [KeyboardButton("Мой баланс")],
+                [KeyboardButton("История")],
+                [KeyboardButton("Использовать баллы")],
+                [KeyboardButton("Сотрудники")],
+                [KeyboardButton("Прайс-лист")],
+                [KeyboardButton("Правила")],
+            ]
+        
+        markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Выберите действие:",
+            reply_markup=markup
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при показе главного меню: {e}")
+        # Попробуем отправить хотя бы текстовое сообщение
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Произошла ошибка. Пожалуйста, начните снова с команды /start"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
     
 async def handle_date_selection(update: Update, context: CallbackContext):
     """Обработка выбора дня"""
@@ -833,14 +887,20 @@ async def handle_date_selection(update: Update, context: CallbackContext):
         context.user_data['description'] = description
         context.user_data['date'] = selected_date
         
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_request"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_request")
+            ]
+        ])
+        
         # Запрашиваем подтверждение
         await update.message.reply_text(
             f"Вы выбрали дату: {date_display}\n"
             f"Описание: {description}\n\n"
             f"Отправить заявку?",
-            reply_markup=ReplyKeyboardMarkup([
-                [KeyboardButton("✅ Подтвердить"), KeyboardButton("❌ Отмена")]
-            ], resize_keyboard=True)
+            reply_markup=keyboard
         )
         return CONFIRM_REQUEST
         
@@ -849,6 +909,14 @@ async def handle_date_selection(update: Update, context: CallbackContext):
         await update.message.reply_text("Неверный формат даты. Попробуйте снова.")
         return SELECT_DATE
 
+async def add_usage_request(user_id, description, usage_date=None):
+    # Если это заявка на уход раньше, сохраняем дату использования
+    if "Уйти на" in description:
+        # Извлекаем дату из описания
+        date_str = description.split()[-1].strip('()')
+        usage_date = datetime.strptime(date_str, "%d.%m.%Y").strftime("%Y-%m-%d")
+    
+    return await db.add_usage_request(user_id, description, usage_date)
 
 async def handle_confirmation(update: Update, context: CallbackContext):
     """Обработка подтверждения заявки"""
@@ -871,8 +939,20 @@ async def handle_confirmation(update: Update, context: CallbackContext):
             await query.edit_message_text(f"❌ Недостаточно баллов. Ваш баланс: {user[3]}, требуется: {cost}")
             return ConversationHandler.END
         
+        # Извлекаем дату использования
+        usage_date = None
+        if "Уйти на" in description:
+            try:
+                usage_date = context.user_data['date'].strftime("%Y-%m-%d")
+            except:
+                try:
+                    date_str = description.split()[-1].strip('()')
+                    usage_date = datetime.strptime(date_str, "%d.%m.%Y").strftime("%Y-%m-%d")
+                except:
+                    pass
+        
         # Отправляем заявку
-        req_id = await db.add_usage_request(user_id, description)
+        req_id = await db.add_usage_request(user_id, description, usage_date)
         
         # Обновляем сообщение с подтверждением
         await query.edit_message_text(
@@ -880,6 +960,18 @@ async def handle_confirmation(update: Update, context: CallbackContext):
             f"Описание: {description}\n"
             f"Администраторы получили уведомление."
         )
+        
+        # Получаем сегодняшние одобренные заявки
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_requests = await db.get_approved_requests_for_date(today)
+        
+        # Формируем текст с сегодняшними заявками
+        today_text = "\n\n📅 Сегодня одобрены:\n"
+        if today_requests:
+            for req in today_requests:
+                today_text += f"• {req['full_name']} ({req['role']}) — {req['description']}\n"
+        else:
+            today_text += "Нет одобренных заявок"
         
         # Уведомляем админов
         for admin_id in ADMINS:
@@ -894,9 +986,10 @@ async def handle_confirmation(update: Update, context: CallbackContext):
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=f"📩 Новая заявка на использование баллов\n\n"
-                         f"👤 Сотрудник: {user[1]}\n"
+                         f"👤 Сотрудник: {user[1]} ({user[2]})\n"
                          f"📌 Описание: {description}\n"
-                         f"💰 Баланс: {user[3]} баллов",
+                         f"💰 Баланс: {user[3]} баллов"
+                         f"{today_text}",
                     reply_markup=markup
                 )
             except Exception as e:
@@ -905,20 +998,83 @@ async def handle_confirmation(update: Update, context: CallbackContext):
         await show_main_menu_for_chat(context, query.message.chat_id, user_id)
         return MAIN_MENU
     
-    elif query.data == "cancel_request":
-        # Обновляем сообщение с подтверждением
-        await query.edit_message_text("❌ Заявка отменена.")
-        
-        await show_main_menu_for_chat(context, query.message.chat_id, query.from_user.id)
-        return MAIN_MENU
+    # Перенаправляем обработку отмены
+    return await handle_cancel_request(update, context)
     
-    return CONFIRM_REQUEST
+
+async def handle_cancel_request(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        await query.edit_message_text("❌ Заявка отменена")
+    except BadRequest:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❌ Заявка отменена"
+        )
+    
+    # Не очищаем весь контекст, только нужные данные
+    keys_to_remove = ['usage_type', 'hours', 'date', 'description']
+    for key in keys_to_remove:
+        context.user_data.pop(key, None)
+    
+    await show_main_menu_for_chat(context, query.message.chat_id, query.from_user.id)
+    return MAIN_MENU
+
 
 async def ignore_callback(update: Update, context: CallbackContext):
     """Игнорирует нажатия на недоступные даты"""
     query = update.callback_query
     await query.answer()
 
+#---------ежедневное уведомлени админов------------#
+async def send_daily_usage_notifications(context: CallbackContext):
+    try:
+        logger.info("🔔 Начало отправки уведомлений")
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        requests = await db.get_approved_requests_for_date(today)
+        
+        if not ADMINS:
+            logger.error("Список ADMINS пуст!")
+            return
+
+        message = "📅 На сегодня нет запланированных использований баллов."
+        if requests:
+            message = "📅 Запланированные использования баллов на сегодня:\n\n" + \
+                     "\n".join(f"• {req['full_name']} — {req['description']}" for req in requests)
+
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=message,
+                    parse_mode='HTML'
+                )
+                logger.info(f"Сообщение отправлено админу {admin_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+
+
+async def check_today_requests(update: Update, context: CallbackContext):
+    """Ручная проверка запланированных использований на сегодня"""
+       
+    today = datetime.now().strftime("%Y-%m-%d")
+    requests = await db.get_approved_requests_for_date(today)
+    
+    if not requests:
+        await update.message.reply_text("📅 На сегодня нет запланированных использований баллов.")
+    else:
+        message = "📅 Запланированные использования баллов на сегодня:\n\n"
+        for req in requests:
+            # Форматируем дату для отображения
+            usage_date = datetime.strptime(req['usage_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+            message += f"• {req['full_name']} — {req['description']} ({usage_date})\n"
+        await update.message.reply_text(message)
 
 
 async def use_points_description(update: Update, context: CallbackContext):
@@ -934,7 +1090,21 @@ async def use_points_description(update: Update, context: CallbackContext):
         await update.message.reply_text("Вы не зарегистрированы.")
         return MAIN_MENU
 
-    msg = f"Новая заявка на использование баллов от {user[1]} (баланс: {user[3]} баллов):\n\n{desc}"
+    # Получаем сегодняшние одобренные заявки
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_requests = await db.get_approved_requests_for_date(today)
+    
+    # Формируем текст с сегодняшними заявками
+    today_text = "\n\n📅 Сегодня одобрены:\n"
+    if today_requests:
+        for req in today_requests:
+            today_text += f"• {req['full_name']} ({req['role']}) — {req['description']}\n"
+    else:
+        today_text += "Нет одобренных заявок"
+
+    msg = (f"Новая заявка на использование баллов от {user[1]} ({user[2]}) "
+           f"(баланс: {user[3]} баллов):\n\n{desc}"
+           f"{today_text}")
 
     for admin_id in ADMINS:
         try:
@@ -953,6 +1123,38 @@ async def use_points_description(update: Update, context: CallbackContext):
     return MAIN_MENU
 
 
+
+#------------------------------------------------------------------------------------------#
+async def background_scheduler(app: Application):
+    """Фоновая задача для ежедневных уведомлений"""
+    last_sent_day = None
+    
+    while True:
+        now = datetime.now()
+        
+        # Триггер в 15:03 (для теста) и только 1 раз в день
+        if now.hour == 10 and now.minute == 0 and now.day != last_sent_day:
+            try:
+                # Создаем правильный контекст
+                from telegram.ext import CallbackContext
+                context = CallbackContext(app)
+                
+                await send_daily_usage_notifications(context)
+                last_sent_day = now.day
+                logger.info("✅ Уведомления отправлены")
+            except Exception as e:
+                logger.error(f"❌ Ошибка в планировщике: {e}")
+                # При серьезной ошибке делаем паузу перед повторной попыткой
+                await asyncio.sleep(300)
+        
+        await asyncio.sleep(30)
+
+
+
+#--------------------------------------------------------------------------------------------#
+
+
+
 async def fallback(update: Update, context: CallbackContext):
     """Обработчик неизвестных команд."""
     await update.message.reply_text("Неизвестная команда. Возвращаюсь в главное меню.")
@@ -965,6 +1167,10 @@ async def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    
+    # Замените текущие обработчики на эти (должны быть ДО conv_handler):
+    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern="^confirm_request$"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_request, pattern="^cancel_request$"))
     # Обработчики inline-кнопок
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^(approve|reject)_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_queue_buttons, pattern="^(clear_queue|back_to_menu)$"))
@@ -973,7 +1179,8 @@ async def main():
     # Добавьте этот обработчик в main()
     app.add_handler(CallbackQueryHandler(ignore_callback, pattern="^ignore$"))
     app.add_handler(CallbackQueryHandler(handle_calendar, pattern=r"^(nav|date|cancel)_"))
-    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern="^(confirm_request|cancel_request)$"))
+    # Замените существующую регистрацию на:
+    # Убедитесь, что обработчик зарегистрирован правильно:
     # Основной обработчик диалогов
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -993,6 +1200,7 @@ async def main():
                 MessageHandler(filters.Regex("^Изменения$"), show_admin_changes_menu),
                 MessageHandler(filters.Regex("^Изменить правила$"), edit_rules),
                 MessageHandler(filters.Regex("^Изменить прайс-лист$"), edit_price),
+                MessageHandler(filters.Regex("^Заявки на сегодня$"), check_today_requests),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],
@@ -1012,11 +1220,13 @@ async def main():
         fallbacks=[MessageHandler(filters.ALL, fallback)]
     )
 
+
     app.add_handler(conv_handler)
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-        
+    asyncio.create_task(background_scheduler(app))
+
         # Бесконечный цикл работы бота
     while True:
         await asyncio.sleep(3600)
