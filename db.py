@@ -2,6 +2,8 @@ import aiosqlite
 import logging
 import os
 from datetime import datetime
+import pandas as pd
+import glob
 
 DB_PATH = 'database.sqlite3'
 
@@ -247,10 +249,77 @@ class Database:
             await db.execute("DELETE FROM usage_requests WHERE status = 'approved'")
             await db.commit()
     
-
-
-
-
+# --- Резервная копия ---
+    async def create_backup(self):
+        """Создает резервную копию базы данных в Excel"""
+        max_backups = 10  # Максимальное количество хранимых бэкапов
+        backups = sorted(glob.glob(os.path.join(backup_dir, "backup_*.xlsx")))
+        if len(backups) >= max_backups:
+            for old_backup in backups[:-max_backups]:
+                try:
+                    os.remove(old_backup)
+                except:
+                    pass
+                
+        try:
+            backup_dir = 'backups'
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(backup_dir, f"backup_{timestamp}.xlsx")
+            
+            async with aiosqlite.connect(self.db_path) as db:
+                # Получаем только пользовательские таблицы (исключаем системные)
+                cursor = await db.execute("""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' 
+                    AND name NOT LIKE 'sqlite_%'
+                """)
+                tables = [row[0] for row in await cursor.fetchall()]
+                
+                if not tables:
+                    raise Exception("В базе нет таблиц для резервирования")
+                
+                # Создаем новый Excel-файл
+                with pd.ExcelWriter(backup_path, engine='openpyxl') as writer:
+                    # Создаем временный лист, который потом удалим
+                    temp_sheet = writer.book.create_sheet("temp")
+                    
+                    for table in tables:
+                        try:
+                            # Получаем данные таблицы
+                            cursor = await db.execute(f"SELECT * FROM {table}")
+                            columns = [desc[0] for desc in cursor.description]
+                            data = await cursor.fetchall()
+                            
+                            if data:  # Создаем лист только если есть данные
+                                df = pd.DataFrame(data, columns=columns)
+                                df.to_excel(
+                                    writer,
+                                    sheet_name=table[:31],  # Максимум 31 символ для имени листа
+                                    index=False
+                                )
+                        except Exception as e:
+                            logging.error(f"Ошибка экспорта таблицы {table}: {e}")
+                            continue
+                    
+                    # Удаляем временный лист
+                    if 'temp' in writer.book.sheetnames:
+                        writer.book.remove(writer.book['temp'])
+                    
+                    # Если не создано ни одного листа, создаем пустой с сообщением
+                    if not writer.book.sheetnames:
+                        ws = writer.book.create_sheet("Информация")
+                        ws['A1'] = "Нет данных для экспорта"
+            
+            return backup_path
+            
+        except Exception as e:
+            # Удаляем частично созданный файл при ошибке
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+            raise Exception(f"Ошибка создания резервной копии: {str(e)}")
+    
 # --- Глобальный экземпляр ---
 db = Database()
 

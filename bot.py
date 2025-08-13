@@ -19,6 +19,7 @@ import json
 from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES, price_text, rules_text, SUPERADMINS
 from calendar import monthrange, month_name
 import locale
+import os
 # Состояния ConversationHandler
 (
     MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
@@ -80,6 +81,7 @@ async def show_main_menu(update: Update):
             [KeyboardButton("Проверка заявок на использование")],
             [KeyboardButton("История сотрудника")],
             [KeyboardButton("Сотрудники")],
+            [KeyboardButton("Создать резервную копию")],
             [KeyboardButton("Изменения")],
         ]
     elif user_id in SUPERADMINS:
@@ -91,6 +93,7 @@ async def show_main_menu(update: Update):
             [KeyboardButton("Проверка заявок на использование")],
             [KeyboardButton("История сотрудника")],
             [KeyboardButton("Сотрудники")],
+            [KeyboardButton("Создать резервную копию")],
             [KeyboardButton("Изменения")],
         ]
     else:
@@ -943,6 +946,7 @@ async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_i
                 [KeyboardButton("Проверка заявок на использование")],
                 [KeyboardButton("История сотрудника")],
                 [KeyboardButton("Сотрудники")],
+                [KeyboardButton("Создать резервную копию")],
                 [KeyboardButton("Изменения")],
             ]
         elif user_id in SUPERADMINS:
@@ -953,7 +957,8 @@ async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_i
                 [KeyboardButton("Заявки на сегодня")], 
                 [KeyboardButton("Проверка заявок на использование")],
                 [KeyboardButton("История сотрудника")],
-                [KeyboardButton("Сотрудники")],
+                [KeyboardButton("Сотрудники")],                
+                [KeyboardButton("Создать резервную копию")],
                 [KeyboardButton("Изменения")],
             ]
         else:
@@ -1252,12 +1257,87 @@ async def use_points_description(update: Update, context: CallbackContext):
     await show_main_menu(update)
     return MAIN_MENU
 
+#---------------------Резервная копия------------------------#
+async def handle_backup_request(update: Update, context: CallbackContext):
+    if update.effective_user.id not in ADMINS + SUPERADMINS:
+        await update.message.reply_text("⛔ У вас нет прав для этой команды.")
+        return MAIN_MENU
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, создать", callback_data="confirm_backup"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel_backup")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    await update.message.reply_text(
+        "Создать резервную копию базы данных?\n"
+        "Это может занять несколько секунд...",
+        reply_markup=reply_markup
+    )
+    return ConversationHandler.END 
+
+async def handle_backup_confirmation(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_backup":
+        try:
+            message =  await query.message.reply_text("🔄 Создание резервной копии...")
+            backup_path = await db.create_backup()
+
+            file_size = os.path.getsize(backup_path) / (1024 * 1024)
+
+            if file_size > 50:
+                await query.message.reply_text(
+                    "⚠️ Файл бэкапа слишком большой для Telegram (>50MB).\n"
+                    f"Размер: {file_size:.2f}MB\n"
+                    f"Путь: {backup_path}"
+                )
+            else:
+                with open(backup_path, 'rb') as backup_file:
+                    await query.message.reply_document(
+                        document=backup_file,
+                        caption=f"📦 Резервная копия от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                    )
+
+                    await message.delete()
+        except Exception as e:
+            logger.error(f"Ошибка создания резервной копии: {e}")
+            await query.message.reply_text("❌ Ошибка при создании резервной копии")
+    
+    await query.edit_message_text(
+        text="Операция с резервной копией завершена",
+        reply_markup=None
+    )
+
+
+async def manual_backups(update: Update, context: CallbackContext):
+    if update.effective_user.id not in ADMINS + SUPERADMINS:
+        await update.message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    
+    try:
+        msg = await update.message.reply_text("🔄 Создание резервной копии...")
+        backup_path = await db.create_backup()
+
+        with open(backup_path, 'rb') as backup_file:
+            await update.message.reply_document(
+                document=backup_file,
+                caption=f"📦 Резервная копия за {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            )
+        
+        await msg.delete()
+    except Exception as e:
+        logger.error(f"Ошибка создания резервной копии: {e}")
+        await update.message.reply_text("❌ Ошибка при создании резервной копии")
 
 #------------------------------------------------------------------------------------------#
 async def background_scheduler(app: Application):
     """Фоновая задача для ежедневных уведомлений"""
     last_sent_day = None
+    last_backup_day = None
     
     while True:
         now = datetime.now()
@@ -1276,8 +1356,20 @@ async def background_scheduler(app: Application):
                 logger.error(f"❌ Ошибка в планировщике: {e}")
                 # При серьезной ошибке делаем паузу перед повторной попыткой
                 await asyncio.sleep(300)
+
+
+        if now.hour == 22 and now.minute == 0 and now.day != last_backup_day:
+            try:
+                await db.create_backup()
+                last_backup_day = now.day
+                
+                logger.info("✅ Резервная копия создана")
+            except Exception as e:
+                
+                logger.error(f"❌ Ошибка создания резервной копии: {e}")
+
         
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 
@@ -1309,6 +1401,7 @@ async def main():
     # Добавьте этот обработчик в main()
     app.add_handler(CallbackQueryHandler(ignore_callback, pattern="^ignore$"))
     app.add_handler(CallbackQueryHandler(handle_calendar, pattern=r"^(nav|date|cancel)_"))
+    app.add_handler(CallbackQueryHandler( handle_backup_confirmation, pattern="^(confirm|cancel)_backup$"))
     # Замените существующую регистрацию на:
     # Убедитесь, что обработчик зарегистрирован правильно:
     # Основной обработчик диалогов
@@ -1333,6 +1426,7 @@ async def main():
                 MessageHandler(filters.Regex("^Заявки на сегодня$"), check_today_requests),
                 MessageHandler(filters.Regex('^Главное меню$'), handle_main_menu_button),
                 MessageHandler(filters.Regex("^Редактировать начисление баллов$"), edit_price_lists),
+                MessageHandler(filters.Regex("^Создать резервную копию$"),handle_backup_request),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],
