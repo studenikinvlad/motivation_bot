@@ -1,19 +1,13 @@
-##BOT_TOKEN = "1853641903:AAFzKzkC4N5EWQcTnnkxzPfYiPfFj3rNq7Q"  #Для теста
-BOT_TOKEN = "7997019934:AAE8MNNxaWJ5Qb-Y_YDCU5inJe4Oqg9cYVg"
+BOT_TOKEN = token
 
 # Telegram user_ids админов, которые могут начислять и списывать баллы
 ADMIN_INFO = {
-    510183516: ("Сажко Денис Викторович", "ЗУМ"),
-    2140661690 : ("Я", "Тип"),
+    777: ("j", "ЗУМ"),
+    777 : ("Я", "Тип"),
 }
-SUPERADMINS = [2140661690]  # user_id суперадмина
-ADMINS = [510183516, 2140661690]       # обычные админы
+SUPERADMINS = [777]  # user_id суперадмина
+ADMINS = [777, 777]       # обычные админы
 
-DB_HOST = 'amvera-studenikinvlad-cnpg-botapp-rw'
-DB_NAME = 'superdb'
-DB_USER = 'tgapps'
-DB_PASSWORD = 'qwerty'
-DB_PORT = 5432
 
 
 # Прайс-лист баллов для УСМ
@@ -71,4 +65,5 @@ rules_text = """
 9. Условия могут меняться. Актуальные — здесь и на кухне.
 10. Баллы можно обменивать между собой (ПК ↔ ПК, УСМ ↔ УСМ).
 """
+
 
