@@ -2,7 +2,7 @@ import logging
 import asyncio
 from telegram.ext import Application  
 from telegram.error import BadRequest
-from datetime import datetime, timedelta, time
+from datetime import datetime
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -34,6 +34,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+async def handle_main_menu_button(update: Update, context: CallbackContext):
+    """Обработчик кнопки 'Главное меню'."""
+    await show_main_menu(update)  # Отправляем главное меню
+    return MAIN_MENU
+
 async def ensure_registered(update: Update) -> bool:
     """Проверка регистрации пользователя."""
     user_id = update.effective_user.id
@@ -55,7 +60,7 @@ async def start(update: Update, context: CallbackContext):
     user = await db.get_user(user_id)
     if user is None:
         await update.message.reply_text(
-            "Добро пожаловать! Пожалуйста, введите ваше ФИО для регистрации:"
+            "Добро пожаловать! Пожалуйста, введите ваше Фамилию и Имя для регистрации:"
         )
         return REGISTRATION_FIO
     else:
@@ -144,7 +149,7 @@ async def show_admin_changes_menu(update: Update, context: CallbackContext):
         [KeyboardButton("Удаление сотрудника")],
         [KeyboardButton("Изменить правила")],
         [KeyboardButton("Изменить прайс-лист")],
-        [KeyboardButton("Назад")],
+        [KeyboardButton("Главное меню")],
     ]
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Меню изменений:", reply_markup=markup)
@@ -342,7 +347,8 @@ async def begin_point_change(update: Update, context: CallbackContext):
     """Начало изменения баллов."""
     buttons = [
         [KeyboardButton("Начислить баллы")],
-        [KeyboardButton("Списать баллы")]
+        [KeyboardButton("Списать баллы")],
+        [KeyboardButton("Главное меню")]
     ]
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выберите действие:", reply_markup=markup)
@@ -350,6 +356,10 @@ async def begin_point_change(update: Update, context: CallbackContext):
 
 async def select_action(update: Update, context: CallbackContext):
     action = update.message.text
+    if action == "Главное меню":
+        await show_main_menu(update)  # Возвращаем в главное меню
+        return MAIN_MENU
+    
     if action not in ["Начислить баллы", "Списать баллы"]:
         await update.message.reply_text("Пожалуйста, выберите из вариантов.")
         return SELECT_ACTION
@@ -357,6 +367,7 @@ async def select_action(update: Update, context: CallbackContext):
     context.user_data['action'] = action
     users = await db.get_all_users()
     buttons = [[KeyboardButton(f"{u[1]} ({u[0]})")] for u in users]
+    buttons.append([KeyboardButton("Главное меню")])
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выберите сотрудника:", reply_markup=markup)
     return SELECT_USER
@@ -364,6 +375,10 @@ async def select_action(update: Update, context: CallbackContext):
 
 async def select_user(update: Update, context: CallbackContext):
     selected = update.message.text
+    if selected == "Главное меню":
+        await show_main_menu(update)  # Возвращаем в главное меню
+        return MAIN_MENU
+    
     try:
         name, uid = selected.rsplit('(', 1)
         user_id = int(uid[:-1])
@@ -374,6 +389,7 @@ async def select_user(update: Update, context: CallbackContext):
     context.user_data['selected_user_id'] = user_id
     action = context.user_data['action']
 
+    
     if action == "Списать баллы":
         await update.message.reply_text(
             "Введите количество баллов для списания и причину через точку с запятой (;).\n"
@@ -391,6 +407,7 @@ async def select_user(update: Update, context: CallbackContext):
 
         buttons = [[KeyboardButton(reason)] for reason in score_table.keys()]
         buttons.append([KeyboardButton("Другое")])
+        buttons.append([KeyboardButton("Главное меню")])
         markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Выберите причину:", reply_markup=markup)
         return SELECT_REASON
@@ -432,6 +449,10 @@ async def select_reason(update: Update, context: CallbackContext):
     if reason == "Другое":
         await update.message.reply_text("Введите количество баллов (целое число):")
         return ENTER_CUSTOM_POINTS
+    
+    if reason == "Главное меню":
+        await show_main_menu(update)  # Возвращаем в главное меню
+        return MAIN_MENU
 
     if reason not in score_table:
         await update.message.reply_text("Неверная причина. Попробуйте снова.")
@@ -498,19 +519,30 @@ async def check_usage_requests(update: Update, context: CallbackContext):
         await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=markup)
 
 async def show_approved_requests(update, context):
-    """Показать одобренные заявки."""
-    requests = await db.get_latest_approved_requests()
+    """Показать актуальные одобренные заявки"""
+    requests = await db.get_active_approved_requests()
+    
     if not requests:
-        await update.message.reply_text("Очередь пуста.")
+        await update.message.reply_text("Нет активных одобренных заявок.")
         return
 
-    text_lines = ["✅Одобренные заявки\n"]
-    for req_id, fio, desc, date in requests:
-        text_lines.append(f" {fio} — {desc} ({date})")
+    text_lines = ["✅ Актуальные одобренные заявки:\n"]
+    
+    for req in requests:
+        line = f"• {req['full_name']} — {req['description']}"
+        
+        if req['usage_date']:
+            usage_date = datetime.strptime(req['usage_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+            line += f" (на {usage_date})"
+        else:
+            line += " (без конкретной даты)"
+            
+        text_lines.append(line)
+
     text = "\n".join(text_lines)
 
     keyboard = [
-        [InlineKeyboardButton("Очистить очередь", callback_data="clear_queue")],
+        [InlineKeyboardButton("Очистить ВСЕ заявки", callback_data="clear_queue")],
         [InlineKeyboardButton("Назад", callback_data="back_to_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1201,6 +1233,7 @@ async def main():
                 MessageHandler(filters.Regex("^Изменить правила$"), edit_rules),
                 MessageHandler(filters.Regex("^Изменить прайс-лист$"), edit_price),
                 MessageHandler(filters.Regex("^Заявки на сегодня$"), check_today_requests),
+                MessageHandler(filters.Regex('^Главное меню$'), handle_main_menu_button),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],

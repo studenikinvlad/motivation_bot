@@ -207,6 +207,30 @@ class Database:
             
             cursor = await db.execute(query, params)
             return await cursor.fetchall()   
+        
+    async def get_active_approved_requests(self):
+        """Получает актуальные одобренные заявки:
+        - Если есть usage_date: показываем только если дата >= сегодня
+        - Если нет usage_date: показываем всегда
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT r.id, u.full_name, r.description, r.created_at, r.usage_date
+                FROM usage_requests r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.status = 'approved'
+                AND (r.usage_date IS NULL OR date(r.usage_date) >= date(?))
+                ORDER BY 
+                    CASE 
+                        WHEN r.usage_date IS NULL THEN 0  -- Сначала заявки без даты
+                        ELSE 1  -- Затем заявки с датой
+                    END,
+                    r.usage_date ASC  -- Сортировка по дате использования (если есть)
+                LIMIT 10
+            """, (today,))
+            return await cursor.fetchall()
 
     async def approve_request(self, request_id):
         async with aiosqlite.connect(self.db_path) as db:
