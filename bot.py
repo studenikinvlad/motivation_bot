@@ -14,6 +14,8 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from db import db
+import re
+import json
 from config import BOT_TOKEN, ADMINS, ADMIN_INFO, USM_SCORES, CONSULTANT_SCORES, price_text, rules_text, SUPERADMINS
 from calendar import monthrange, month_name
 import locale
@@ -22,8 +24,8 @@ import locale
     MAIN_MENU, CHOOSE_ACTION, ENTER_DESCRIPTION, SELECT_USER,
     SELECT_REASON, CONFIRM_POINTS, SELECT_EMPLOYEE_FOR_HISTORY, SELECT_ACTION,
     ENTER_CUSTOM_POINTS, ENTER_DEDUCT_POINTS, REGISTRATION_FIO, REGISTRATION_ROLE, EDIT_TEXT_INPUT,
-    SELECT_USAGE_TYPE, SELECT_DATE, CONFIRM_REQUEST, CANCEL_REQUEST    # Добавленные состояния
-) = range(17)
+    SELECT_USAGE_TYPE, SELECT_DATE, CONFIRM_REQUEST, CANCEL_REQUEST, EDIT_PRICE_LIST, SELECT_PRICE_ITEM, ENTER_NEW_POINTS    # Добавленные состояния
+) = range(20)
 
 locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
 
@@ -138,8 +140,101 @@ async def registration_role(update: Update, context: CallbackContext):
     return MAIN_MENU
 
 
-#------------------------------SUPERADMIN---------------------------------#
+#------------------------------Начисление баллов---------------------------------#
+async def edit_price_lists(update: Update, context: CallbackContext):
+    """Меню выбора прайс-листа для редактирования"""
+    buttons = [
+        [KeyboardButton("Прайс-лист УСМ")],
+        [KeyboardButton("Прайс-лист Консультантов")],
+        [KeyboardButton("Назад")]
+    ]
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    await update.message.reply_text("Выберите прайс-лист для редактирования:", reply_markup=markup)
+    return EDIT_PRICE_LIST
 
+async def select_price_list(update: Update, context: CallbackContext):
+    """Обработка выбора прайс-листа"""
+    choice = update.message.text
+    if choice == "Назад":
+        await show_main_menu(update)
+        return MAIN_MENU
+    
+    price_list = USM_SCORES if "УСМ" in choice else CONSULTANT_SCORES
+    context.user_data['current_price_list'] = price_list
+    context.user_data['price_list_name'] = "USM_SCORES" if "УСМ" in choice else "CONSULTANT_SCORES"
+    
+    # Создаем клавиатуру с пунктами прайса
+    buttons = [[KeyboardButton(item)] for item in price_list.keys()]
+    buttons.append([KeyboardButton("Назад")])
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        f"Текущие баллы в {choice}:\n\n" +
+        "\n".join([f"{k}: {v} баллов" for k, v in price_list.items()]) +
+        "\n\nВыберите пункт для изменения:",
+        reply_markup=markup
+    )
+    return SELECT_PRICE_ITEM
+
+async def select_price_item(update: Update, context: CallbackContext):
+    """Обработка выбора пункта прайса"""
+    item = update.message.text
+    if item == "Назад":
+        return await edit_price_lists(update, context)
+    
+    price_list = context.user_data['current_price_list']
+    if item not in price_list:
+        await update.message.reply_text("Пожалуйста, выберите пункт из списка.")
+        return SELECT_PRICE_ITEM
+    
+    context.user_data['selected_item'] = item
+    await update.message.reply_text(
+        f"Текущее значение для '{item}': {price_list[item]} баллов\n"
+        "Введите новое количество баллов (целое число):"
+    )
+    return ENTER_NEW_POINTS
+
+async def save_new_points(update: Update, context: CallbackContext):
+    """Сохранение новых баллов"""
+    try:
+        new_points = int(update.message.text)
+        if new_points <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите положительное целое число.")
+        return ENTER_NEW_POINTS
+    
+    price_list = context.user_data['current_price_list']
+    item = context.user_data['selected_item']
+    price_list[item] = new_points
+    
+    # Сохраняем изменения в config.py
+    price_list_name = context.user_data['price_list_name']
+    with open('config.py', 'r+', encoding='utf-8') as f:
+        content = f.read()
+        if price_list_name == "USM_SCORES":
+            content = re.sub(
+                r'USM_SCORES = {[^}]*}',
+                f'USM_SCORES = {json.dumps(USM_SCORES, ensure_ascii=False, indent=4)}',
+                content
+            )
+        else:
+            content = re.sub(
+                r'CONSULTANT_SCORES = {[^}]*}',
+                f'CONSULTANT_SCORES = {json.dumps(CONSULTANT_SCORES, ensure_ascii=False, indent=4)}',
+                content
+            )
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+    
+    await update.message.reply_text(
+        f"✅ Значение для '{item}' изменено на {new_points} баллов.\n\n"
+        f"Обновленный прайс-лист:\n" +
+        "\n".join([f"{k}: {v} баллов" for k, v in price_list.items()])
+    )
+    await show_main_menu(update)
+    return MAIN_MENU
 
 #-------------------------------------------------------------------------#
 
@@ -149,6 +244,7 @@ async def show_admin_changes_menu(update: Update, context: CallbackContext):
         [KeyboardButton("Удаление сотрудника")],
         [KeyboardButton("Изменить правила")],
         [KeyboardButton("Изменить прайс-лист")],
+        [KeyboardButton("Редактировать начисление баллов")],
         [KeyboardButton("Главное меню")],
     ]
     markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
@@ -843,6 +939,7 @@ async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_i
             buttons = [
                 [KeyboardButton("Начислить/Списать баллы")],
                 [KeyboardButton("Очередь использования баллов")],
+                [KeyboardButton("Заявки на сегодня")], 
                 [KeyboardButton("Проверка заявок на использование")],
                 [KeyboardButton("История сотрудника")],
                 [KeyboardButton("Сотрудники")],
@@ -852,7 +949,8 @@ async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_i
             buttons = [
                 [KeyboardButton("Начислить/Списать баллы")],
                 [KeyboardButton("Начислить/Списать баллы (silent)")],
-                [KeyboardButton("Очередь использования баллов")],
+                [KeyboardButton("Очередь использования баллов")],                
+                [KeyboardButton("Заявки на сегодня")], 
                 [KeyboardButton("Проверка заявок на использование")],
                 [KeyboardButton("История сотрудника")],
                 [KeyboardButton("Сотрудники")],
@@ -1234,6 +1332,7 @@ async def main():
                 MessageHandler(filters.Regex("^Изменить прайс-лист$"), edit_price),
                 MessageHandler(filters.Regex("^Заявки на сегодня$"), check_today_requests),
                 MessageHandler(filters.Regex('^Главное меню$'), handle_main_menu_button),
+                MessageHandler(filters.Regex("^Редактировать начисление баллов$"), edit_price_lists),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],
@@ -1249,6 +1348,9 @@ async def main():
             REGISTRATION_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_fio)],
             REGISTRATION_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_role)],
             EDIT_TEXT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_text_input)],
+            EDIT_PRICE_LIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_price_list)],
+            SELECT_PRICE_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_price_item)],
+        ENTER_NEW_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_points)],
         },
         fallbacks=[MessageHandler(filters.ALL, fallback)]
     )
