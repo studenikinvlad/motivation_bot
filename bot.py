@@ -29,7 +29,7 @@ import os
 ) = range(20)
 
 locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
-
+admins_list = set(ADMINS + SUPERADMINS)
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -45,7 +45,7 @@ async def handle_main_menu_button(update: Update, context: CallbackContext):
 async def ensure_registered(update: Update) -> bool:
     """Проверка регистрации пользователя."""
     user_id = update.effective_user.id
-    if user_id in ADMINS or user_id in SUPERADMINS:
+    if user_id in admins_list:
         return True
     if not await db.get_user(user_id):
         await update.message.reply_text("Вы не зарегистрированы. Напишите /start.")
@@ -56,7 +56,7 @@ async def start(update: Update, context: CallbackContext):
     """Обработчик команды /start."""
     user_id = update.effective_user.id
     
-    if user_id in ADMINS or user_id in SUPERADMINS:
+    if user_id in admins_list:
         await show_main_menu(update)
         return MAIN_MENU
 
@@ -100,7 +100,8 @@ async def show_main_menu(update: Update):
         buttons = [
             [KeyboardButton("Мой баланс")],
             [KeyboardButton("История")],
-            [KeyboardButton("Использовать баллы")],
+            [KeyboardButton("Использовать баллы")],         
+            [KeyboardButton("Мои заявки")], 
             [KeyboardButton("Заявки на сегодня")],  # Новая кнопка
             [KeyboardButton("Сотрудники")],
             [KeyboardButton("Прайс-лист")],
@@ -304,7 +305,7 @@ async def handle_delete_user(update, context):
     query = update.callback_query
     await query.answer()
 
-    if query.from_user.id not in ADMINS and query.from_user.id not in SUPERADMINS:
+    if query.from_user.id not in admins_list :
         await query.edit_message_text("⛔️ У вас нет прав для удаления сотрудников.")
         return
     
@@ -597,7 +598,7 @@ async def enter_custom_points(update: Update, context: CallbackContext):
 async def check_usage_requests(update: Update, context: CallbackContext):
     """Проверка заявок на использование баллов."""
     user_id = update.effective_user.id
-    if user_id not in ADMINS and user_id not in SUPERADMINS:
+    if user_id not in admins_list :
         await update.message.reply_text("⛔️ У вас нет доступа к этой функции.")
         return
 
@@ -686,8 +687,60 @@ async def handle_admin_action(update: Update, context: CallbackContext):
         await query.edit_message_text("❌ Заявка отклонена.")
 
 #-------------------------------------------------------------------------------------------------------------#
+async def show_my_requests(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    requests = await db.get_user_requests(user_id)
 
+    if not requests:
+        await update.message.reply_text("У вас нет активных заявок")
+        return MAIN_MENU
+    
+    keyboard = []
+    for req in requests:
+        date_info = f" на {req['usage_date']}" if req["usage_date"] else ""
+        text = f"{req['id']}: {req['description']}{date_info}"
+        keyboard.append([
+            InlineKeyboardButton(text, callback_data=f"show_req_{req['id']}"),
+            InlineKeyboardButton("❌ Удалить", callback_data=f"delete_req_{req['id']}")
+        ])
 
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "Ваши активные заявки",
+            reply_markup=reply_markup
+        )
+
+async def handle_request_deletion(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+
+    req_id = int(query.data.split("_")[-1])
+    user_id = query.from_user.id
+
+    request = await db.get_request(req_id)
+    if not request:
+        await query.edit_message_text("Заявка не найдена")
+        return
+
+    success = await db.delete_request(req_id, user_id)
+
+    if success:
+        await query.edit_message_text("✅ Заявка удалена")
+
+        user = await db.get_user(user_id)
+        for admin_id in admins_list :
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"❌ Сотрудник {user[1]} удалил свою заявку:\n"
+                         f"ID: {req_id}\n"
+                         f"Описание: {request['description']}\n"
+                )
+            except Exception as e:
+                logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
+    else: 
+        await query.edit_message_text("❌ Не удалось удалить заявку или она вам не принадлежит.")
 
 async def use_points(update: Update, context: CallbackContext):
     """Использование баллов."""
@@ -966,6 +1019,7 @@ async def show_main_menu_for_chat(context: CallbackContext, chat_id: int, user_i
                 [KeyboardButton("Мой баланс")],
                 [KeyboardButton("История")],
                 [KeyboardButton("Использовать баллы")],
+                [KeyboardButton("Мои заявки")],
                 [KeyboardButton("Сотрудники")],
                 [KeyboardButton("Прайс-лист")],
                 [KeyboardButton("Правила")],
@@ -1109,7 +1163,7 @@ async def handle_confirmation(update: Update, context: CallbackContext):
             today_text += "Нет одобренных заявок"
         
         # Уведомляем админов
-        for admin_id in ADMINS:
+        for admin_id in admins_list :
             try:
                 buttons = [
                     [
@@ -1171,7 +1225,7 @@ async def send_daily_usage_notifications(context: CallbackContext):
         today = datetime.now().strftime("%Y-%m-%d")
         requests = await db.get_approved_requests_for_date(today)
         
-        if not ADMINS:
+        if not admins_list :
             logger.error("Список ADMINS пуст!")
             return
 
@@ -1180,7 +1234,7 @@ async def send_daily_usage_notifications(context: CallbackContext):
             message = "📅 Запланированные использования баллов на сегодня:\n\n" + \
                      "\n".join(f"• {req['full_name']} — {req['description']}" for req in requests)
 
-        for admin_id in ADMINS:
+        for admin_id in admins_list :
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
@@ -1241,7 +1295,7 @@ async def use_points_description(update: Update, context: CallbackContext):
            f"(баланс: {user[3]} баллов):\n\n{desc}"
            f"{today_text}")
 
-    for admin_id in ADMINS:
+    for admin_id in admins_list :
         try:
             buttons = [
                 [
@@ -1259,7 +1313,7 @@ async def use_points_description(update: Update, context: CallbackContext):
 
 #---------------------Резервная копия------------------------#
 async def handle_backup_request(update: Update, context: CallbackContext):
-    if update.effective_user.id not in ADMINS + SUPERADMINS:
+    if update.effective_user.id not in admins_list :
         await update.message.reply_text("⛔ У вас нет прав для этой команды.")
         return MAIN_MENU
     
@@ -1314,7 +1368,7 @@ async def handle_backup_confirmation(update: Update, context: CallbackContext):
 
 
 async def manual_backups(update: Update, context: CallbackContext):
-    if update.effective_user.id not in ADMINS + SUPERADMINS:
+    if update.effective_user.id not in admins_list :
         await update.message.reply_text("⛔ У вас нет прав для этой команды.")
         return
     
@@ -1402,6 +1456,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(ignore_callback, pattern="^ignore$"))
     app.add_handler(CallbackQueryHandler(handle_calendar, pattern=r"^(nav|date|cancel)_"))
     app.add_handler(CallbackQueryHandler( handle_backup_confirmation, pattern="^(confirm|cancel)_backup$"))
+    app.add_handler(CallbackQueryHandler(handle_request_deletion, pattern="^delete_req_\\d+$"))
     # Замените существующую регистрацию на:
     # Убедитесь, что обработчик зарегистрирован правильно:
     # Основной обработчик диалогов
@@ -1427,6 +1482,7 @@ async def main():
                 MessageHandler(filters.Regex('^Главное меню$'), handle_main_menu_button),
                 MessageHandler(filters.Regex("^Редактировать начисление баллов$"), edit_price_lists),
                 MessageHandler(filters.Regex("^Создать резервную копию$"),handle_backup_request),
+                MessageHandler(filters.Regex("^Мои заявки$"), show_my_requests),
                 MessageHandler(filters.ALL, fallback)
             ],
             SELECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_user)],

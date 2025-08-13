@@ -112,6 +112,34 @@ class Database:
         return await self.get_history(employee_id)
 
     # --- Заявки ---
+    async def get_user_requests(self, user_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+            SELECT id, description, status, created_at, usage_date
+            FROM usage_requests
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
+            return await cursor.fetchall()
+        
+    async def delete_request(self, request_id, user_id=None):
+        request_id = int(request_id)  # Явное преобразование
+        if user_id is not None:
+            user_id = int(user_id)  # Явное преобразование
+        async with aiosqlite.connect(self.db_path) as db:
+            if user_id:
+                cursor = await db.execute(
+                    "SELECT 1 FROM usage_requests WHERE id = ? AND user_id = ?",
+                    (request_id, user_id)
+                )
+                if not await cursor.fetchone():
+                    return False
+            await db.execute("DELETE FROM usage_requests WHERE id = ?",
+                             (request_id,))
+            await db.commit()
+            return True
+
     async def add_usage_request(self, user_id, description, usage_date=None):
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
@@ -260,7 +288,7 @@ class Database:
                     os.remove(old_backup)
                 except:
                     pass
-                
+
         try:
             backup_dir = 'backups'
             os.makedirs(backup_dir, exist_ok=True)
